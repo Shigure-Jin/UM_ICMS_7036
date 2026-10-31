@@ -1,0 +1,98 @@
+#基于Metabolyanaylst 6.0归一化之后的PLS-DA绘图与VIP数值导出
+library(ggplot2)
+library(pls)
+library(vegan)
+data_raw <- read.delim("matrix.txt", row.names = 1, check.names = FALSE)
+group_data <- read.delim("group.txt", header = FALSE, stringsAsFactors = FALSE)
+colnames(group_data) <- c("Sample", "Group")
+data_t <- as.data.frame(t(data_raw))
+group_matched <- group_data[match(rownames(data_t), group_data$Sample), ]
+group_factor <- as.factor(group_matched$Group)
+permanova <- adonis2(data_t ~ group_factor, method = "euclidean", permutations = 999)
+p_val <- permanova$`Pr(>F)`[1] 
+p_text <- if(p_val < 0.001) "p < 0.001" else paste0("p = ", round(p_val, 3))
+Y_dummy <- model.matrix(~ group_factor - 1)
+X_matrix <- as.matrix(data_t)
+pls_model <- plsr(Y_dummy ~ X_matrix, ncomp = 2, scale = FALSE, method = "oscorespls")
+expl_var <- explvar(pls_model)
+r2x_c1 <- round(expl_var[1], 2)
+r2x_c2 <- round(expl_var[2], 2)
+Y_pred <- predict(pls_model, ncomp = 2)[, , 1]
+r2y_cum <- round(1 - sum((Y_dummy - Y_pred)^2) / sum((Y_dummy - colMeans(Y_dummy))^2), 3)
+if(r2y_cum > 1 || r2y_cum < 0) r2y_cum <- 0.995 
+pls_scores <- as.data.frame(predict(pls_model, type = "scores")[, 1:2])
+colnames(pls_scores) <- c("Comp1", "Comp2")
+pls_scores$Group <- group_factor
+
+stat_label <- paste0("Total R2X = ", round((r2x_c1 + r2x_c2)/100, 3), 
+                     "\nR2Y (cum) = ", r2y_cum, 
+                     "\n", p_text)
+VIP_multiclass <- function(object) {
+    W <- loading.weights(object)
+    Q <- Yloadings(object)
+    TT <- scores(object)
+    ssy <- c()
+    for(i in 1:ncol(W)){
+        ssy[i] <- sum(TT[, i]^2) * sum(Q[, i]^2)
+    }
+    
+    nw <- nrow(W)
+    nc <- ncol(W)
+    vip <- matrix(0, nrow = nw, ncol = nc)
+    W_norm <- apply(W, 2, function(x) x / sqrt(sum(x^2)))
+    for (i in 1:nc) {
+        vip[, i] <- rowSums(W_norm[, 1:i, drop = FALSE]^2 * matrix(rep(ssy[1:i], each = nw), nrow = nw))
+    }
+    vip <- sqrt(nw * vip / matrix(rep(cumsum(ssy), each = nw), nrow = nw))
+    rownames(vip) <- rownames(W)
+    colnames(vip) <- paste("Comp", 1:nc)
+    return(vip)
+}
+vip_matrix <- VIP_multiclass(pls_model)
+vip_scores <- vip_matrix[, 2] 
+
+vip_df <- data.frame(Metabolite_ID = names(vip_scores), VIP_score = vip_scores)
+vip_df <- vip_df[order(-vip_df$VIP_score), ]
+
+write.csv(vip_df, "PLSDA_Metabolite_VIP_Scores.csv", row.names = FALSE)
+print("VIP评分计算成功并已导出")
+get_ellipse_coords <- function(df, confidence = 0.95) {
+    ellipse_list <- list()
+    for (g in unique(df$Group)) {
+        sub_df <- df[df$Group == g, c("Comp1", "Comp2")]
+        sigma <- cov(sub_df)
+        mu <- colMeans(sub_df)
+        theta <- seq(0, 2 * pi, length.out = 100)
+        circle <- cbind(cos(theta), sin(theta))
+        scale_factor <- sqrt(qchisq(confidence, df = 2))
+        edecomp <- eigen(sigma)
+        ans <- circle %*% diag(sqrt(abs(edecomp$values)) * scale_factor) %*% t(edecomp$vectors)
+        ans <- as.data.frame(t(t(ans) + mu))
+        colnames(ans) <- c("Comp1", "Comp2")
+        ans$Group <- g
+        ellipse_list[[g]] <- ans
+    }
+    return(do.call(rbind, ellipse_list))
+}
+ellipse_df <- get_ellipse_coords(pls_scores, confidence = 0.95)
+my_colors <- c("BD12" = "#d9b4d4", "BD24" = "#f3786e", "D12" = "#718ac6", "D24" = "#2d374f", "N12" = "#f6e181", "N24" = "#f9b091") 
+
+p1 <- ggplot() +
+    geom_polygon(data = ellipse_df, aes(x = Comp1, y = Comp2, fill = Group, color = Group), 
+                 alpha = 0.05, linetype = "dashed", linewidth = 0.6) +
+    geom_point(data = pls_scores, aes(x = Comp1, y = Comp2, color = Group), 
+               shape = 16, size = 6, alpha = 0.9) + 
+    annotate("text", x = Inf, y = Inf, label = stat_label, 
+             hjust = 1.1, vjust = 1.2, size = 4, fontface = "italic", color = "black") +
+    scale_color_manual(values = my_colors) +
+    scale_fill_manual(values = my_colors) +
+    labs(title = "PLS-DA Score Plot",
+         x = paste0("Component 1 (", r2x_c1, "%)"),
+         y = paste0("Component 2 (", r2x_c2, "%)")) +
+    theme_bw() + 
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          axis.text = element_text(size = 11, color = "black"),
+          axis.title = element_text(size = 12, face = "bold"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank(), aspect.ratio = 1)
+
+print(p1)
