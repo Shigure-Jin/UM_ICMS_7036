@@ -1,0 +1,64 @@
+# 本文件为代谢组下机数据的PQN标准化方法，以及去除了小于Blank10倍的label
+library(data.table)
+
+raw <- fread("origin_matrix.txt", sep = "\t", header = TRUE, data.table = FALSE)
+
+feat_id <- as.character(raw[[1]])
+labels  <- trimws(as.character(unlist(raw[1, -1])))
+
+mat <- raw[-1, -1]
+rownames(mat) <- as.character(feat_id[-1])
+mat[] <- lapply(mat, function(x) as.numeric(as.character(x)))
+mat <- as.matrix(mat); storage.mode(mat) <- "double"
+
+if (any(rownames(mat) == "Label")) mat <- mat[rownames(mat) != "Label", , drop = FALSE]
+
+cat("原始维度:", dim(mat), "\n")
+
+idx_blank  <- which(labels == "Blank")
+idx_sample <- which(labels != "Blank")          # 非Blank样本（PQN参考谱只用这些）
+grp        <- labels[idx_sample]                # 非Blank分组
+uniq_grp   <- unique(grp)
+cat("分组:", paste(uniq_grp, collapse = ", "), "\n")
+
+# 某组内 >20% 样本 > 10×Blank均值
+blank_mean <- rowMeans(mat[, idx_blank, drop = FALSE], na.rm = TRUE)
+blank_mean_safe <- pmax(blank_mean, 1e-9)      
+
+thr <- 10 * blank_mean_safe                     
+min_prop <- 0.20                                
+
+pass_grp <- sapply(uniq_grp, function(g) {
+  cols <- idx_sample[grp == g]
+  rowMeans(mat[, cols, drop = FALSE] > thr, na.rm = TRUE) >= min_prop
+})
+
+keep_feat <- rowSums(pass_grp, na.rm = TRUE) >= 1   
+mat_f <- mat[keep_feat, , drop = FALSE]
+
+cat("筛选后特征数:", sum(keep_feat), " (去除", sum(!keep_feat), ")\n")
+print(colSums(pass_grp))
+
+pqn_normalize <- function(x) {
+  ref  <- apply(x, 1, median, na.rm = TRUE)
+  quot <- sweep(x, 1, ref, "/")
+  dil  <- apply(quot, 2, median, na.rm = TRUE)
+  list(data = sweep(x, 2, dil, "/"), dilution = dil, ref = ref)
+}
+
+pqn <- pqn_normalize(mat_f[, idx_sample, drop = FALSE])
+
+mat_out <- mat_f
+mat_out[, idx_sample] <- pqn$data
+if (length(idx_blank) > 0) {
+  q_blank <- sweep(mat_f[, idx_blank, drop = FALSE], 1, pqn$ref, "/")
+  dil_blank <- apply(q_blank, 2, median, na.rm = TRUE)
+  mat_out[, idx_blank] <- sweep(mat_f[, idx_blank, drop = FALSE], 2, dil_blank, "/")
+}
+
+cat("PQN 完成，输出维度:", dim(mat_out), "\n")
+
+out <- data.frame(Feature = rownames(mat_out), mat_out, check.names = FALSE)
+fwrite(out, "matrix_pqn_filtered.txt", sep = "\t")
+
+cat("已导出: matrix_pqn_filtered.txt\n")
