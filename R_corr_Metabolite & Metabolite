@@ -1,0 +1,157 @@
+# ============================================================
+# 代谢组中感兴趣的代谢物与代谢物之间的关系分析，输入的是下机的原始数据，用的是PQN标准化，lm拟合
+# ============================================================
+library(tidyverse)
+library(corrplot)
+library(patchwork)
+
+df_raw <- read.delim("hisold.txt", check.names = FALSE, row.names = 1,
+                     fill = TRUE, na.strings = c("", "NA"))
+
+df_raw <- df_raw[, colSums(!is.na(df_raw)) > 0, drop = FALSE]
+
+m <- as.matrix(df_raw)
+m[!is.finite(m)] <- NA
+m[m < 0] <- NA
+
+cat("原始维度：", dim(m), "\n")
+cat("每行有效值数：\n"); print(rowSums(!is.na(m)))
+
+# ============================================================
+# 2. PQN 归一化（Probabilistic Quotient Normalization）
+#    (1) 每个代谢物取跨样本中位数，构成参考谱
+#    (2) 每个样本各代谢物除以参考谱对应值，得到商
+#    (3) 取每个样本这些商的中位数作为该样本的归一化因子
+#    (4) 每个样本除以自己的归一化因子
+# ============================================================
+pqn_normalize <- function(mat) {
+    ref <- apply(mat, 1, median, na.rm = TRUE)
+    ref[ref == 0 | is.na(ref)] <- 1
+    quotients <- sweep(mat, 1, ref, "/")
+    norm_factors <- apply(quotients, 2, median, na.rm = TRUE)
+    norm_factors[norm_factors == 0 | is.na(norm_factors)] <- 1
+    norm_mat <- sweep(mat, 2, norm_factors, "/")
+    attr(norm_mat, "norm_factors") <- norm_factors
+    norm_mat
+}
+
+log_mat <- log2(m + 1)
+norm_mat <- pqn_normalize(log_mat)
+
+cat("归一化因子范围：", range(attr(norm_mat, "norm_factors")), "\n")
+write.csv(norm_mat, "PQN_normalized_metabolites.csv")
+
+cat("归一化后 NA 数：", sum(is.na(norm_mat)), "\n")
+
+mat <- t(norm_mat) %>% as.data.frame()
+mat$Sample <- rownames(mat)
+metabolites <- setdiff(colnames(mat), "Sample")
+
+mat <- mat %>% filter(if_all(all_of(metabolites), ~ is.finite(.)))
+
+mat$Group <- ifelse(grepl("^Healthy", mat$Sample), "Healthy",
+                    ifelse(grepl("^CRC", mat$Sample), "CRC", NA))
+mat <- mat %>% filter(!is.na(Group))
+mat$Group <- factor(mat$Group, levels = c("Healthy", "CRC"))
+
+cat("各组样本量：\n"); print(table(mat$Group))
+
+group_list <- list(Healthy = mat[mat$Group == "Healthy", ],
+                   CRC     = mat[mat$Group == "CRC", ],
+                   All     = mat)
+
+cor_all <- list()
+for (gname in names(group_list)) {
+    sub <- group_list[[gname]]
+    res <- list(); k <- 1
+    for (i in 1:(length(metabolites)-1)) {
+        for (j in (i+1):length(metabolites)) {
+            m1 <- metabolites[i]; m2 <- metabolites[j]
+            ok <- is.finite(sub[[m1]]) & is.finite(sub[[m2]])
+            if (sum(ok) < 3) {
+                res[[k]] <- data.frame(Group = gname, Met1 = m1, Met2 = m2,
+                                       r = NA, p = NA, slope = NA, intercept = NA, n = sum(ok))
+                k <- k + 1; next
+            }
+            x <- sub[[m1]][ok]; y <- sub[[m2]][ok]
+            ct <- cor.test(x, y, method = "pearson")
+            fit <- lm(y ~ x)
+            res[[k]] <- data.frame(Group = gname, Met1 = m1, Met2 = m2,
+                                   r = unname(ct$estimate), p = ct$p.value,
+                                   slope = coef(fit)[2], intercept = coef(fit)[1],
+                                   n = sum(ok))
+            k <- k + 1
+        }
+    }
+    cor_all[[gname]] <- bind_rows(res)
+}
+cor_df <- bind_rows(cor_all)
+
+cor_df <- cor_df %>% group_by(Group) %>% mutate(FDR = p.adjust(p, method = "BH")) %>% ungroup()
+write.csv(cor_df, "PQN_correlation_results_with_FDR.csv", row.names = FALSE)
+print(cor_df)
+
+for (gname in names(group_list)) {
+    sub <- group_list[[gname]][, metabolites]
+    cm <- cor(sub, method = "pearson", use = "complete.obs")
+    pm <- matrix(1, length(metabolites), length(metabolites),
+                 dimnames = list(metabolites, metabolites))
+    for (i in 1:(length(metabolites)-1)) {
+        for (j in (i+1):length(metabolites)) {
+            row <- cor_df %>% filter(Group == gname, Met1 == metabolites[i], Met2 == metabolites[j])
+            pm[i, j] <- row$FDR; pm[j, i] <- row$FDR
+        }
+    }
+    pdf(paste0("PQN_cor_heatmap_", gname, ".pdf"), width = 7, height = 6)
+    corrplot(cm, method = "color", type = "upper", tl.col = "black",
+             tl.srt = 45, number.cex = 0.8,
+             p.mat = pm, sig.level = c(0.001, 0.01, 0.05),
+             insig = "label_sig", pch.cex = 1.2, pch.col = "black",
+             title = paste0(gname, " (n=", nrow(sub), ")"), mar = c(0,0,2,0))
+    dev.off()
+}
+
+for (gname in names(group_list)) {
+    sub <- group_list[[gname]]
+    plist <- list(); k <- 1
+    for (i in 1:(length(metabolites)-1)) {
+        for (j in (i+1):length(metabolites)) {
+            m1 <- metabolites[i]; m2 <- metabolites[j]
+            row <- cor_df %>% filter(Group == gname, Met1 == m1, Met2 == m2)
+            lab <- paste0("R = ", sprintf("%.2f", row$r), "\nFDR = ", sprintf("%.3g", row$FDR))
+            plist[[k]] <- ggplot(sub, aes(x = .data[[m1]], y = .data[[m2]])) +
+                geom_point(alpha = 0.6, size = 1.3, color = "#2E86AB") +
+                geom_smooth(method = "lm", se = TRUE, color = "#D1495B", formula = y ~ x) +
+                annotate("text", x = -Inf, y = Inf, label = lab,
+                         hjust = -0.1, vjust = 1.3, size = 3) +
+                labs(x = gsub("\\.", " ", m1), y = gsub("\\.", " ", m2),
+                     title = paste(gsub("\\.", " ", m1), "vs", gsub("\\.", " ", m2))) +
+                theme_bw(base_size = 9)
+            k <- k + 1
+        }
+    }
+    ggsave(paste0("PQN_pairs_scatter_lm_", gname, ".pdf"),
+           wrap_plots(plist, ncol = 5), width = 20, height = 15)
+}
+
+cor_spear <- list()
+for (gname in names(group_list)) {
+    sub <- group_list[[gname]]
+    res <- list(); k <- 1
+    for (i in 1:(length(metabolites)-1)) {
+        for (j in (i+1):length(metabolites)) {
+            m1 <- metabolites[i]; m2 <- metabolites[j]
+            ok <- is.finite(sub[[m1]]) & is.finite(sub[[m2]])
+            if (sum(ok) < 3) { k <- k + 1; next }
+            ct <- cor.test(sub[[m1]][ok], sub[[m2]][ok], method = "spearman")
+            res[[k]] <- data.frame(Group = gname, Met1 = m1, Met2 = m2,
+                                   rho = unname(ct$estimate), p = ct$p.value, n = sum(ok))
+            k <- k + 1
+        }
+    }
+    cor_spear[[gname]] <- bind_rows(res)
+}
+cor_spear_df <- bind_rows(cor_spear) %>%
+    group_by(Group) %>% mutate(FDR = p.adjust(p, method = "BH")) %>% ungroup()
+write.csv(cor_spear_df, "PQN_spearman_sensitivity.csv", row.names = FALSE)
+print(cor_spear_df)
