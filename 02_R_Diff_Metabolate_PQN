@@ -1,0 +1,138 @@
+
+# 2026_11_02修改为基于PQN标准化后的数据的wilconx差异分析
+
+expr_data <- read.delim("matrix.txt", row.names = 1, check.names = FALSE)
+meta_data <- read.delim("group.txt", header = TRUE, stringsAsFactors = FALSE)
+meta_data$Group <- as.factor(meta_data$Group)
+comp_data <- read.delim("compare.txt", header = FALSE, stringsAsFactors = FALSE)
+colnames(comp_data) <- c("Group1", "Group2")
+
+cat("Data loaded. Samples:", ncol(expr_data), " Genes:", nrow(expr_data), "\n")
+
+expr_data <- expr_data[rowSums(expr_data > 0) >= 0.2 * ncol(expr_data), ]
+cat("Genes retained:", nrow(expr_data), "\n")
+
+genes <- rownames(expr_data)
+n_genes <- length(genes)
+
+global_kw_p <- rep(NA, n_genes)          # Kruskal-Wallis 全局 p 值
+log2fc_list <- list()
+wilcox_p_list <- list()
+
+for (i in 1:nrow(comp_data)) {
+    comp_name <- paste0(comp_data$Group1[i], "_vs_", comp_data$Group2[i])
+    log2fc_list[[comp_name]] <- rep(NA, n_genes)
+    wilcox_p_list[[comp_name]] <- rep(NA, n_genes)
+}
+
+cat("Running Kruskal-Wallis and Wilcoxon tests...\n")
+
+for (g in 1:n_genes) {
+    # 构造当前基因的表达向量，合并分组信息
+    temp <- data.frame(Sample = colnames(expr_data),
+                       Expr = as.numeric(expr_data[g, ]))
+    temp <- merge(temp, meta_data, by = "Sample")
+    
+    groups_present <- unique(temp$Group)
+    if (length(groups_present) < 2) next   
+    
+    # ---- 全局 Kruskal-Wallis 检验 ----
+    kw <- tryCatch(kruskal.test(Expr ~ Group, data = temp),
+                   error = function(e) NULL)
+    if (!is.null(kw)) {
+        global_kw_p[g] <- kw$p.value
+    }
+    
+    # 计算各组均值（用于 Log2FC）
+    means <- tapply(temp$Expr, temp$Group, mean, na.rm = TRUE)
+    
+    for (i in 1:nrow(comp_data)) {
+        g1 <- comp_data$Group1[i]
+        g2 <- comp_data$Group2[i]
+        comp_name <- paste0(g1, "_vs_", g2)
+        
+        # 提取两组数据
+        x <- temp$Expr[temp$Group == g1]
+        y <- temp$Expr[temp$Group == g2]
+        
+        # 若任一组样本数 < 2，则无法做秩和检验
+        if (length(x) < 2 || length(y) < 2) next
+        
+        # 计算 Log2FC（使用均值 + 伪计数 1，避免 log(0)）
+        m1 <- mean(x, na.rm = TRUE)
+        m2 <- mean(y, na.rm = TRUE)
+        log2fc_list[[comp_name]][g] <- log2((m1 + 1) / (m2 + 1))
+        
+        # 两样本 Wilcoxon 检验（非配对，双侧）
+        wt <- tryCatch(wilcox.test(x, y, exact = FALSE),
+                       error = function(e) NULL)
+        if (!is.null(wt)) {
+            wilcox_p_list[[comp_name]][g] <- wt$p.value
+        }
+    }
+}
+
+cat("Calculations done.\n")
+
+cat("Assembling results and adjusting p-values...\n")
+
+final_result <- data.frame(Label = genes, Global_KW_Pval = global_kw_p)
+
+for (i in 1:nrow(comp_data)) {
+    comp_name <- paste0(comp_data$Group1[i], "_vs_", comp_data$Group2[i])
+    raw_p <- wilcox_p_list[[comp_name]]
+    valid <- !is.na(raw_p)
+    fdr <- rep(NA, length(raw_p))
+    if (sum(valid) > 0) {
+        fdr[valid] <- p.adjust(raw_p[valid], method = "BH")
+    }
+    
+    res_temp <- data.frame(
+        Log2FC = log2fc_list[[comp_name]],
+        Wilcox_P_value = raw_p,
+        FDR_AdjP = fdr
+    )
+    colnames(res_temp) <- paste0(comp_name, "_", c("Log2FC", "P_value", "FDR_AdjP"))
+    final_result <- cbind(final_result, res_temp)
+}
+
+
+cat("Generating summary labels (threshold: |Log2FC| > 0.585 & FDR < 0.05)...\n")
+
+summary_col <- rep("", n_genes)
+
+for (i in 1:nrow(comp_data)) {
+    g1 <- comp_data$Group1[i]
+    g2 <- comp_data$Group2[i]
+    comp_name <- paste0(g1, "_vs_", g2)
+    
+    fc_col <- paste0(comp_name, "_Log2FC")
+    fdr_col <- paste0(comp_name, "_FDR_AdjP")
+    
+    if (fc_col %in% colnames(final_result) && fdr_col %in% colnames(final_result)) {
+        fc_vals <- final_result[[fc_col]]
+        fdr_vals <- final_result[[fdr_col]]
+        
+
+        fc_vals[is.na(fc_vals)] <- 0
+        fdr_vals[is.na(fdr_vals)] <- 1
+        
+        idx_up <- which(fc_vals > 0.585 & fdr_vals < 0.05)
+        if (length(idx_up) > 0) {
+            prefix <- ifelse(summary_col[idx_up] == "", "", " | ")
+            summary_col[idx_up] <- paste0(summary_col[idx_up], prefix, g1, " > ", g2)
+        }
+        
+        idx_down <- which(fc_vals < -0.585 & fdr_vals < 0.05)
+        if (length(idx_down) > 0) {
+            prefix <- ifelse(summary_col[idx_down] == "", "", " | ")
+            summary_col[idx_down] <- paste0(summary_col[idx_down], prefix, g1, " < ", g2)
+        }
+    }
+}
+
+summary_col[summary_col == ""] <- "ns"
+final_result$Summary <- summary_col
+
+write.csv(final_result, file = "Differential_Analysis_NonParam_Results.csv", row.names = FALSE)
+cat("Done! Results saved as Differential_Analysis_NonParam_Results.csv\n")
