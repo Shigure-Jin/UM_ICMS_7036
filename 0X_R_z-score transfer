@@ -1,0 +1,26 @@
+mat <- read.delim("matrix.txt",
+                  header = TRUE,
+                  check.names = FALSE,
+                  stringsAsFactors = FALSE)
+dim(mat)
+head(mat[, 1:5])
+feature <- mat[[1]]
+x <- as.matrix(mat[, -1])
+storage.mode(x) <- "numeric"
+sum(is.na(x))
+row_means <- rowMeans(x, na.rm = TRUE)
+row_sds <- apply(x, 1, sd, na.rm = TRUE)
+row_sds[row_sds == 0 | is.na(row_sds)] <- NA
+z <- sweep(x, 1, row_means, FUN = "-")
+z <- sweep(z, 1, row_sds, FUN = "/")
+z_df <- data.frame(Feature = feature, z,
+                   check.names = FALSE)
+
+write.table(z_df,
+            file = "matrix_zscore_by_row.txt",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+round(rowMeans(z, na.rm = TRUE)[1:5], 6)
+round(apply(z, 1, sd, na.rm = TRUE)[1:5], 6)
