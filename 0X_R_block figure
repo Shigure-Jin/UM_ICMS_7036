@@ -1,0 +1,49 @@
+
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(ggh4x)
+
+expr_data <- read.table("histidine.txt", header = TRUE, sep = "\t", check.names = FALSE)
+meta_data <- read.table("group.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+expr_long <- expr_data %>%
+    pivot_longer(
+        cols = -Label,
+        names_to = "Sample",
+        values_to = "Zscore"
+    ) %>%
+    left_join(meta_data, by = "Sample")
+
+expr_long$Group  <- factor(expr_long$Group,  levels = c("Healthy", "CRC"))
+expr_long$Gender <- factor(expr_long$Gender, levels = c("Male", "Female"))
+my_comparisons <- list(c("Healthy", "CRC"))
+
+
+p <- ggplot(expr_long, aes(x = Group, y = Zscore, color = Gender, fill = Gender)) +
+    geom_jitter(position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8),
+                size = 1.5, alpha = 0.4) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 3.5,
+                 color = "black", stroke = 1,
+                 position = position_dodge(0.8), show.legend = FALSE) +
+    facet_wrap(~ Label, scales = "free_y") +   # 要是想要所有的纵坐标相同，这里改为scales = "fixed"
+    scale_color_manual(values = c("Male" = "#00BFC4", "Female" = "#F8766D")) +
+    scale_fill_manual(values  = c("Male" = "#00BFC4", "Female" = "#F8766D")) +
+    theme_bw() +
+    labs(
+        x = "Clinical Group",
+        y = "Metabolite Z-score",
+        color = "Gender",
+        fill = "Gender",
+        title = "Metabolite Distribution with Gender-Specific Means"
+    ) +
+    stat_compare_means(comparisons = my_comparisons,
+                       method = "wilcox.test",
+                       label = "p.signif", hide.ns = TRUE) +
+    theme(
+        plot.title   = element_text(hjust = 0.5, face = "bold"),
+        axis.text.x  = element_text(angle = 45, hjust = 1)
+    ) +
+    force_panelsizes(cols = unit(5, "cm"), rows = unit(6.5, "cm"))
+print(p)
+ggsave("histidine.pdf", plot = p, limitsize = FALSE, dpi = 300)
